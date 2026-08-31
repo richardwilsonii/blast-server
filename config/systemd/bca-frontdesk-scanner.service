@@ -1,0 +1,15 @@
+[Unit]
+Description=BCA Front Desk ACR122U Scanner Bridge
+After=network-online.target pcscd.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=blasty
+WorkingDirectory=/home/blasty/bca/scripts
+ExecStart=/usr/bin/python3 /home/blasty/bca/scripts/acr122u_frontdesk_bridge.py
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,2 @@
+# Existing blasty user crontab entry: daily at 03:10 local time.
+10 3 * * * /home/blasty/bca/scripts/backup_bca_db.sh >> /home/blasty/bca/backups/backup.log 2>&1

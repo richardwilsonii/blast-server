@@ -1,0 +1,13 @@
+# Required packages for Blast site-node bootstrap.
+# Version details are recorded in docs/site-node-bootstrap.md.
+tailscale
+openssh-server
+openssh-client
+rsync
+python3
+bash
+iproute2
+iputils-ping
+coreutils
+sudo
+git

@@ -1,0 +1,59 @@
+# Local secrets and credentials
+.env
+.env.*
+!.env.example
+environment
+*.key
+*.pem
+*.p12
+*.pfx
+*.crt
+*.credentials
+*_secret
+*_secrets
+
+# SSH and host identity material
+.ssh/
+authorized_keys
+known_hosts*
+ssh_host_*_key
+id_rsa*
+id_ed25519*
+id_ecdsa*
+
+# Node-RED runtime, credentials, and unsanitized flows
+node_modules/
+node-red/flows.json
+**/flows_cred.json
+**/.config.*.json
+**/.flows*.backup
+**/cronplusdata/
+**/.rpimon_speed_test.bin
+
+# Databases, backups, logs, and runtime state
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+*.dump
+*.log
+bca/db/
+bca/backups/
+backups/
+cache/
+queue/
+results/
+state/
+logs/
+
+# Generated package/repository data
+.aptly/
+aptly-data/
+
+# Tailscale and operating-system runtime state
+tailscale-state/
+*.pid
+*.sock
+*.swp
+*~
+.DS_Store
