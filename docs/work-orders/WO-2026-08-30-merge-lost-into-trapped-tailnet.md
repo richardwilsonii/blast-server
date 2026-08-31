@@ -51,19 +51,44 @@ The most recently documented LAN state for `blast-server` is:
 - LAN subnet: `192.168.1.0/24`
 - management account: `blasty`
 
-Treat that IP as previously observed, not guaranteed current. Verify it before relying on it.
+Treat that IP as previously observed until verified. It has now been successfully used for recovery as described below.
+
+### Verified recovery state — August 30, 2026
+
+A working non-`blast-server`-Tailscale recovery path has now been established:
+
+```text
+blast-pc
+  -> Lost tailnet
+  -> blast-imac (Lost Tailscale IP 100.68.120.123)
+  -> Lost local LAN
+  -> blast-server at 192.168.1.23
+```
+
+From `blast-imac`, `ssh blasty@192.168.1.23` succeeded and an interactive shell on `blast-server` is available. This LAN hop remains usable even though `blast-server` itself is currently logged out of Tailscale.
+
+Current `blast-server` Tailscale state observed from that recovered shell:
+
+```text
+tailscale status
+=> Logged out.
+```
+
+The failed/aborted login attempt produced a browser authentication URL. **Do not commit, copy into documentation, or treat that URL as durable state.** If authentication is still pending, Work may use the current live URL only through the user's active session/browser; otherwise generate a fresh supported login flow from the protected LAN SSH session.
+
+`tailscale switch --list` without sudo returned `Access denied: profiles access denied`; use `sudo tailscale switch --list` for read-only profile inspection. Do not run another identity-changing command until the current profile/account state is understood and the LAN recovery shell is confirmed active.
 
 ## Safety rules
 
 1. Migrate **one device at a time**.
 2. Do not delete any device from the old Lost tailnet until that device is confirmed working on Trapped.
 3. Before changing Tailscale identity on any remote machine, establish a management path that does **not** depend on the Tailscale session being changed: local LAN SSH, physical console, or another verified recovery path.
-4. For `blast-server`, prefer LAN SSH from `blast-pc` while both are physically on the Lost/Blast LAN.
-5. Verify the current LAN IP rather than assuming `192.168.1.23` is still correct.
+4. For `blast-server`, preserve the now-verified path `blast-pc -> Lost tailnet -> blast-imac -> LAN 192.168.1.23 -> blast-server` until Trapped-side access is independently verified.
+5. Verify the current LAN IP before future reliance if the SSH session is lost or DHCP state changes.
 6. Do not change hostnames, application configuration, Node-RED, MQTT, PostgreSQL, BCA, scanner services, firewall policy, or unrelated networking as part of this migration.
 7. Do not enable subnet routing, exit-node routing, or broad LAN advertisement merely to make the migration easier.
 8. Do not modify the existing ~120-device Trapped fleet.
-9. Do not commit Tailscale auth keys, node keys, state files, credentials, or other secrets to Git.
+9. Do not commit Tailscale auth keys, node keys, login URLs, state files, credentials, or other secrets to Git.
 10. If an unexpected condition appears, preserve access and stop rather than improvising a destructive recovery.
 
 ## Phase 1 — Verify account/tailnet state
@@ -81,19 +106,29 @@ Do not remove old-tailnet entries yet.
 
 `blast-server` is the priority because it is the site node and because the previous Tailscale-login attempt dropped remote access.
 
-### Establish a non-Tailscale recovery path
+### Preserve the verified non-Tailscale recovery path
 
-1. Put `blast-pc` on the Lost tailnet if needed so existing access is restored.
-2. Determine the current LAN IP of `blast-server` using already available local information, router/DHCP data, hostname resolution, or a bounded local method. Do not run an unbounded network scan.
-3. From `blast-pc`, verify SSH to `blast-server` over the **LAN address**, not the `100.x` Tailscale address.
-4. Confirm the SSH session remains functional even if the Tailscale client on `blast-server` is stopped/restarted or changes tailnet. Do not intentionally stop it merely for testing unless necessary; the key requirement is that the session is using the LAN path.
-5. Capture the pre-change state with appropriate read-only commands such as Tailscale status/account information, IP addresses, routes, hostname, and relevant service state.
+The recovery path is already proven and currently reaches an interactive shell on `blast-server`:
+
+```text
+blast-pc -> Lost Tailscale -> blast-imac -> 192.168.1.23 LAN SSH -> blast-server
+```
+
+Before making another Tailscale identity change:
+
+1. Keep `blast-pc` active on the Lost tailnet.
+2. Keep the SSH session through `blast-imac` to `blast-server` open.
+3. Run read-only inspection first, including `sudo tailscale switch --list`, `tailscale status`, IP addresses, routes, hostname, and relevant service state.
+4. Determine whether a usable prior profile exists or whether `blast-server` must authenticate fresh into Trapped.
+5. Do not close the LAN SSH session merely because a browser authentication step succeeds.
 
 ### Add/switch `blast-server` to Trapped
 
-Use the current supported Tailscale CLI workflow for this installed version. The goal is to add/select the Trapped tailnet under `lostgamesllc@gmail.com` while connected through LAN SSH so a Tailscale restart or identity switch cannot strand the session.
+Use the current supported Tailscale CLI workflow for this installed version. The goal is to add/select the Trapped tailnet under `lostgamesllc@gmail.com` while connected through the verified LAN SSH path so a Tailscale restart or identity switch cannot strand the session.
 
 Do not assume an old CLI sequence if current Tailscale behavior differs; verify the supported command flow before executing it.
+
+If browser authentication is required, Work may operate the Tailscale browser/admin portion, but terminal commands must be executed only through the verified `blast-server` LAN SSH shell unless Work actually has direct terminal access. If Work cannot execute the command itself, give the user exactly one command at a time and wait for the output before continuing.
 
 After `blast-server` is active on Trapped:
 
@@ -103,7 +138,7 @@ After `blast-server` is active on Trapped:
 4. Verify Tailscale reachability from `blast-pc` to `blast-server`.
 5. Verify SSH from `blast-pc` to `blast-server` over the Trapped tailnet.
 6. Verify critical Blast services remain running and reachable as before.
-7. If Trapped connectivity fails, recover over the LAN path and restore the known-good tailnet state before doing anything else.
+7. If Trapped connectivity fails, recover over the preserved `blast-imac` LAN path and restore a known-good state before doing anything else.
 
 Do not remove the old Lost `blast-server` machine entry until all checks pass.
 
