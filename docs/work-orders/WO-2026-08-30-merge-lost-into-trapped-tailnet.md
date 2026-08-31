@@ -79,6 +79,19 @@ Verified Trapped Tailscale IP for `blast-server`:
 
 Do not remove the old Lost registrations yet; cleanup waits until all six devices are confirmed working on Trapped.
 
+## Execution responsibility — Work
+
+The Owner's intent is for ChatGPT Work to perform as much of the remaining migration as its available tools permit, rather than turning the work order into a sequence of manual instructions for the Owner.
+
+Therefore:
+
+1. **Do not ask the Owner to switch `blast-pc` between Tailscale profiles merely to inspect device state, discover an IP, or confirm what the Tailscale admin console can show directly.** Use the Tailscale admin console in Cloud Browser for those browser-accessible tasks.
+2. **Do not ask the Owner to run `tailscale status` on `blast-pc` just to identify `ax15` or another peer.** Inspect the old Lost tailnet directly in the Tailscale admin console first.
+3. Use browser-accessible administration, repository access, and any available remote-management path directly before delegating a step to the Owner.
+4. If a required operation genuinely requires a local desktop tray action, local terminal, SSH session, password entry, or physical access that Work cannot control, state that limitation specifically and minimize Owner involvement to the smallest unavoidable action. Do not delegate tasks that Work can perform itself.
+5. Prefer changing the execution method over asking the Owner to perform unnecessary local discovery. Example: identify `ax15` from the old Lost Machines page rather than asking the Owner to switch `blast-pc` to Lost and run `tailscale status`.
+6. Continue doing the migration, not merely planning it. Browser/admin actions should be executed directly when possible.
+
 ## Safety rules for remaining devices
 
 1. Migrate **one device at a time**.
