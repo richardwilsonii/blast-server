@@ -1,124 +1,85 @@
-# Blast Site-Node Bootstrap
+# Blast Site Node
 
-Verified on August 30, 2026 against the live `blast-server` host.
+Originally bootstrapped August 30, 2026; site-agent implementation updated September 8, 2026.
 
 ## Architectural role
 
-This host remains a Lost/Blast site executor and storage node. Central Trapped authorization, planning, portal, Operations data, software catalogue, audit history, and release authority remain in `richardwilsonii/trapped-infrastructure`.
+`blast-server` is the Lost Games / It's a Blast site executor/storage node. `trapped-server` remains the authority for authorization, governed target scope, Operations data, managed releases/artifact selection, portal behavior and global history.
 
-No Trapped central executors, portal runtime, Rundeck instance, Operations database, release authority, credentials, or Cloudflare portal components were installed or copied here.
+The site node executes only closed-list requests already resolved by central. It does not host a Trapped portal, Rundeck, Operations replica, release catalogue or independent configuration authority.
 
-The central architecture repository was not readable using this host's GitHub SSH identity during bootstrap. Its repository boundary and the explicit constraints in the approved work order were preserved; direct architecture review remains required before implementing a site dispatcher or cross-tailnet protocol.
+## Tailnet state
 
-## Site-node prerequisites
+The Trapped tailnet is the canonical destination. The earlier permanent-separate-tailnet bootstrap assumption was superseded by the active `WO-2026-08-30-merge-lost-into-trapped-tailnet.md` migration.
 
-Every required package was already installed and usable. No package was installed or reinstalled.
+`blast-server` and `blast-pc` are already on the Trapped tailnet. `ax15`, `blast-imac`, `pt1` and `pt1player` remain in that separate migration track. The site-agent boundary is retained because Lost/Blast work and backups execute locally through `blast-server`, not because a second tailnet is required. No subnet route, exit-node route, IP forwarding or LAN bridge is used.
 
-| Package | Installed version |
-| --- | --- |
-| `tailscale` | 1.102.2 |
-| `openssh-server` | 10.0p1 Debian revision 7+deb13u4 |
-| `openssh-client` | 10.0p1 Debian revision 7+deb13u4 |
-| `rsync` | 3.4.1+ds1-5+deb13u4 |
-| `python3` | 3.13.5-1 |
-| `bash` | 5.2.37-2+b9 |
-| `iproute2` | 6.15.0-1 |
-| `iputils-ping` | 20240905-3 |
-| `coreutils` | 9.7-3 |
-| `sudo` | 1.9.16p2-3+deb13u2 |
-| `git` | 2.47.3-0+deb13u1 |
+## Site runtime
 
-Neither `nmap` nor `arp-scan` was installed.
-
-## Site runtime filesystem
-
-The preferred `/srv/trapped-site` could not be created non-interactively because filesystem administration requires a sudo password. The work order permits a documented equivalent when live constraints justify it, so the site root is:
+Live runtime root:
 
 ```text
 /home/blasty/trapped-site/
   backups/
+  bin/
   cache/
+  logs/
+  manifests/
   queue/
   results/
-  manifests/
   state/
-  logs/
 ```
 
-The root and every child directory are owned by `blasty:blasty` with mode `0750`. They are intentionally empty and contain no credentials. A future authenticated site-agent design may move the layout to `/srv/trapped-site` and assign a dedicated service account.
+Runtime payloads, backup data and SSH credentials remain outside Git. The tracked implementation is `site-agent/site_agent.py`; the RPIMon executor also uses the tracked pure helper `site-agent/trapped-rpimon7-flow`.
 
-## SSH readiness
+Result/replay records are bounded to 30 days and at most 1,000 JSON results. Cached managed artifacts are addressed by SHA-256.
 
-- OpenSSH server and client tooling are installed; the `ssh` service is active and enabled.
-- The intended current management account is `blasty`, a member of the local `sudo` group.
-- One authorized-key entry is configured for inbound access.
-- The only explicit client host alias is GitHub, using strict existing host-key data and a dedicated local key.
-- Outbound public-key SSH authentication to GitHub was verified without relaxing host-key checking.
-- No SSH alias, known-host entry, or explicitly configured identity currently exists for the observed local LAN neighbor or the Pi-like `pt1` peers.
-- Production Pis were not modified, arbitrary usernames were not attempted, and strict host-key checking was not disabled.
-- `rsync` 3.4.1 is operational locally. Remote rsync-over-SSH was not attempted because no existing local-Pi SSH trust target was available.
+## Central-to-site authentication
 
-Creating a secure `trapped-server` to `blast-server` management path remains blocked on the approved cross-tailnet transport and authentication design. No broad trust or private key copy was created.
+Central uses a dedicated Ed25519 automation identity, separate from the normal `blasty` maintenance login and separate from any Pi-management key. The authorized-key entry on `blast-server` is forced to the fixed site-agent executable and disables normal shell/forwarding use. The central endpoint pins the Blast host key under strict host-key checking.
 
-## Tailscale boundary
+No central Trapped fleet private key, Operations credential, release catalogue or portal credential is copied to this server.
 
-- Tailscale is active, enabled, online, and joined to the existing Lost/Blast tailnet.
-- Five tailnet peers were visible during inspection.
-- The Pi-like `pt1` peer answered one bounded Tailscale ping through DERP; a direct connection was not established.
-- The host advertises no subnet routes, is not an exit node, and was not moved into the Trapped tailnet.
-- No Lost/Blast LAN subnet was exposed to another tailnet.
+## Site-local Pi trust
 
-## LAN execution readiness
+Blast owns a separate site-local Pi management key plus a strict site-local `known_hosts`. A centrally resolved Lost/Blast target carries its governed current LAN address, but the site agent will not trust an unknown host key or widen target scope.
 
-- Default LAN interface: `wlx1cbfce55b6fa`
-- Host address during inspection: `192.168.1.23/24`
-- Local subnet: `192.168.1.0/24`
-- Default gateway: `192.168.1.1`
-- `ip addr`, `ip route`, and `ip neigh` operate normally.
-- One bounded ping to the gateway succeeded.
-- The only other current neighbor entry, `192.168.1.165`, did not answer one bounded ping and had no existing SSH host-key entry.
-- No unbounded scan was run and no production device was changed.
+There are currently no governed Lost/Blast Pis registered in central Operations, so the Pi `known_hosts` store intentionally has zero enrolled device entries. When a real Lost/Blast Pi is identified/onboarded, verify that Pi's host key and authorize the Blast site-local public key for that device. Do not pre-trust LAN neighbors.
 
-Local `ping`, SSH, and rsync primitives are installed. A governed inventory mapping each managed Pi to an approved address, account, host key, and credential is still needed before remote execution or transfer can be validated safely.
+## Implemented site actions
 
-## Existing local services
+The fixed agent currently implements:
 
-The following services were found active and enabled and were left in place:
+- site status and connection checks;
+- Lost/Blast LAN discovery;
+- light/detailed inventory collection using the exact central collector payload;
+- local full-Pi backup;
+- Node-RED flow backup, change inspection, send and restore;
+- legacy package deployment from the exact central package payload;
+- managed software deployment for all five current catalogue components: RPIMon, Pi inventory, Pi backup watcher, Node-RED audit config and GoldenBullseye PMPhone/Sherpa;
+- one-time next-local-03:00 scheduled reboot.
 
-- BCA front-desk scanner bridge
-- Node-RED
-- Mosquitto MQTT
-- Nginx
-- PostgreSQL
-- OpenSSH
-- Tailscale
-- x11vnc and XRDP
-- Samba
-- CUPS and Avahi
+File-bearing requests are size/SHA-256 bound. Managed software uses the exact artifact selected centrally. Components needing Debian packages receive the checksum-recorded exact dependency closure from central; the Pi does not need access to the Trapped internal APT service.
 
-No existing Blast workload was removed, replaced, restarted, or reconfigured.
+`repair_ssh_access` and `transfer_image` remain protocol-defined explicit refusals until a bounded Blast-side executor is operationally needed. They never fall back to direct central execution.
 
-## Tracked local source and configuration
+## Node-RED safety
 
-The repository now includes:
+The site agent resolves the target's actual active Node-RED flow from runtime/configuration evidence rather than source filename. Before a send overwrites an existing active flow, Blast captures the current active flow and matching credentials locally. Cross-device send replaces only the flow; it does not replace target credentials. Central receives the small Node-RED safety material/metadata required by the governed recovery workflow.
 
-- All 12 BCA database migrations
-- Five BCA administration, scanner, backup, and status scripts
-- The BCA scanner and Node-RED systemd units
-- Node-RED dependency manifests, settings, and static logo
-- The existing BCA backup schedule as documentation/configuration
+## Pi backup policy
 
-The live Node-RED flow was not imported because it contains an email token and personal account references. Credential stores, user/runtime metadata, databases, backups, logs, MQTT credentials, sudoers files, Tailscale state, private keys, and generated Aptly data were also excluded.
+Blast keeps 14 completed local full-Pi backup generations per governed device, oldest first, under the site runtime backup root. Automatic multi-gigabyte full-Pi replication back to `trapped-server` is intentionally disabled during SETUP. Central golden images/software/configuration plus centrally mirrored Node-RED safety material provide the off-site recovery layer currently required.
 
-## Security observations and remaining work
+## Existing Blast workloads
 
-No security setting was changed during this bootstrap. Existing issues remain:
+The host continues to run its existing BCA, Node-RED, Mosquitto, Nginx, PostgreSQL, SSH, Tailscale, x11vnc/XRDP, Samba, CUPS and Avahi workloads. Phase 3 did not replace those services with Trapped equivalents.
 
-- UFW is disabled.
-- Mosquitto accepts anonymous connections on all interfaces.
-- x11vnc uses `-nopw`.
-- The live Node-RED flow contains an email token and stale Raspberry Pi paths and commands.
-- Node-RED HTTP authentication is not clearly configured.
-- Node-RED has passwordless sudo access to scanner controls and broad `systemctl` power operations; this policy requires least-privilege review.
+The initial server review recorded pre-existing security issues including disabled UFW, anonymous Mosquitto, x11vnc `-nopw`, unclear Node-RED HTTP authentication and broad Node-RED sudo capability. Those remain separate Blast hardening work; they are not site-agent prerequisites and no secret values belong in Git.
 
-Before a site agent is implemented, the central architecture must define the authenticated cross-tailnet transport, bounded action schema, target identity and host-key lifecycle, artifact verification, service account, credential storage, replay/idempotency rules, result reporting, and audit handoff. Central Operations data, portal authorization, release authority, and fleet private keys must remain on the central control plane.
+## Remaining work
+
+1. Enroll verified Pi host keys and the Blast site-local public key as real Lost/Blast Pis become governed targets.
+2. Continue the separate active tailnet migration work order for the remaining Lost devices; do not mix that migration with normal site-agent execution.
+3. Add optional SSH-repair/image-transfer executors only if those workflows become useful enough to justify them.
+4. Add telemetry buffering only if site operation demonstrates a need.

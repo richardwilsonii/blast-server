@@ -1,0 +1,574 @@
+#!/usr/bin/env python3
+"""Managed-flow merge, replacement and fingerprinting for RPIMon 7.
+
+Architecture 18.8 and 24.9. RPIMon lives on a dedicated managed tab set marked
+with `trapped_rpimon`, the updater may replace only objects carrying that
+marker, and a normalized hash of every *non*-RPIMon flow object must be
+identical before and after an update. That application-only fingerprint is the
+critical production guardrail, because the full flows.json hash is expected to
+change whenever RPIMon itself changes.
+
+  fingerprint   compute the full and application-only hashes of a flows file
+  merge         produce the post-update flows file from a flows file plus an artifact
+  strip         remove the managed RPIMon objects, for rollback or decommissioning
+  inspect       report what is managed, what is application, and what is legacy
+
+Every subcommand is a pure function over JSON files. Nothing here connects to a
+device, a broker or a database; the deployment controller is what decides
+whether a merge may ever be delivered anywhere.
+
+An incoming RPIMon object whose id an existing non-RPIMon object already holds
+does not stop the update and does not overwrite that object. RPIMon owns the
+incoming side, so the RPIMon-owned id is deterministically remapped and every
+RPIMon-internal reference to it is rewritten with it; the object it collided
+with is untouched and the merge reports what moved. Only a collision that
+somehow survives that remap is still a refusal.
+
+A refusal is emitted as JSON on stdout as well as prose on stderr, with a
+`refusal` key and, for a collision, one entry per colliding object stating what
+that object is and whether RPIMon positively owns it. That contract exists so
+the deployment adapter can report *which* object stopped the update and why it
+was left alone, instead of reducing the refusal to the last line of an error
+stream. The safety boundary is unchanged: only positively owned objects are ever
+replaced, and a refusal writes nothing.
+
+Normalization detail that matters: canvas coordinates and dimensions are
+excluded from the application fingerprint. Node-RED rewrites x/y/w/h whenever
+anyone drags a node, so including them would fail a deployment because a
+technician tidied the canvas last week. Everything that affects behaviour -
+type, wiring, configuration, credentials references - is included.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import pathlib
+import re
+import sys
+import tarfile
+
+
+MARKER_KEY = "trapped_rpimon"
+MARKER_PATTERN = re.compile(r"^trapped-rpimon:(\d+):(.+)$")
+
+# Presentation-only keys Node-RED rewrites on any canvas edit. Excluded from the
+# application fingerprint; see the module docstring.
+VOLATILE_KEYS = {"x", "y", "w", "h", "z_order", "_order"}
+
+# Legacy RPIMon 6.x and earlier had no ownership marker. These are the shapes a
+# legacy object can be recognised by. 18.9 is explicit that only
+# fingerprint-matched legacy objects may be removed and anything unidentified is
+# left alone, so this list is used to *report*, never to delete by guess.
+LEGACY_HINTS = (
+    re.compile(r"^rpimon", re.IGNORECASE),
+    re.compile(r"\brpimon\b", re.IGNORECASE),
+)
+
+
+KNOWN_LEGACY_MANAGED = {
+    "rpimon7-dashboard-group": "fb525657cb75c449ba313cf06d1ef27e39aa23be102b414c90e93b05e3d2f54d",
+    "rpimon7-dashboard-tab": "f80308609e33895de3af76d4bc740dfaa88069e91b8925c44971b103a916577e",
+    "rpimon7-mqtt-broker": "79e5bfb5f872db4975f1c030f2a166bdaa9db241457c6903ef23616be3b91840",
+}
+
+
+# --------------------------------------------------------------------------
+# Ownership of one existing flow object
+# --------------------------------------------------------------------------
+#
+# A refusal is only useful if it says *what* the object in the way actually is.
+# "Refusing to overwrite non-RPIMon flow objects" is true of a game's MQTT
+# broker configuration and of a 6.x dashboard tab somebody renamed, and those two
+# need opposite corrections: one means the artifact claims an id it may not have,
+# the other means legacy ownership was never reconciled. Both are reported; only
+# a positively owned object is ever replaced.
+
+MANAGED_RPIMON = "managed_rpimon"
+KNOWN_LEGACY_MANAGED_OBJECT = "known_legacy_managed"
+LEGACY_FINGERPRINT_MISMATCH = "legacy_fingerprint_mismatch"
+UNVERIFIED_LEGACY_CANDIDATE = "unverified_legacy_candidate"
+APPLICATION_OBJECT = "application_object"
+
+#: The two ownership classes the managed merge is allowed to replace.
+OWNED_BY_RPIMON = (MANAGED_RPIMON, KNOWN_LEGACY_MANAGED_OBJECT)
+
+OWNERSHIP_EVIDENCE = {
+    MANAGED_RPIMON:
+        "carries a valid managed RPIMon ownership marker",
+    KNOWN_LEGACY_MANAGED_OBJECT:
+        "matches an exact governed legacy RPIMon fingerprint",
+    LEGACY_FINGERPRINT_MISMATCH:
+        "its id is a governed legacy RPIMon id but its content does not match "
+        "that governed fingerprint, so RPIMon ownership is not proven",
+    UNVERIFIED_LEGACY_CANDIDATE:
+        "it resembles legacy RPIMon by name only and matches no governed RPIMon "
+        "fingerprint, so RPIMon ownership is not proven",
+    APPLICATION_OBJECT:
+        "it carries no RPIMon ownership marker and matches no governed RPIMon "
+        "fingerprint, so it is an application/unknown object",
+}
+
+
+class FlowError(Exception):
+    """A refusal or a read failure, with the machine-readable form beside it.
+
+    `detail` is the bounded structured contract the deployment adapter consumes.
+    Callers must classify a refusal from `detail["refusal"]` and its named
+    objects, never by matching words in the message: the message exists for a
+    person reading a log.
+    """
+
+    def __init__(self, message: str, detail: dict | None = None):
+        super().__init__(message)
+        self.detail = detail
+
+
+def load_flows(path: pathlib.Path) -> list:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise FlowError(f"cannot read {path}: {exc}") from exc
+    if not isinstance(data, list):
+        raise FlowError(f"{path} is not a Node-RED flows array")
+    return data
+
+
+def marker_of(node: dict) -> str | None:
+    value = node.get(MARKER_KEY)
+    return value if isinstance(value, str) and MARKER_PATTERN.match(value) else None
+
+
+def is_managed(node: dict) -> bool:
+    return marker_of(node) is not None
+
+
+def looks_legacy(node: dict) -> bool:
+    if is_managed(node):
+        return False
+    for field in ("id", "name", "label", "info"):
+        value = node.get(field)
+        if isinstance(value, str) and any(p.search(value) for p in LEGACY_HINTS):
+            return True
+    return False
+
+
+def normalize(node: dict) -> dict:
+    """Strip presentation-only keys, recursively, for stable hashing."""
+    if isinstance(node, dict):
+        return {key: normalize(value) for key, value in sorted(node.items())
+                if key not in VOLATILE_KEYS}
+    if isinstance(node, list):
+        return [normalize(item) for item in node]
+    return node
+
+
+def digest(nodes: list) -> str:
+    ordered = sorted((normalize(node) for node in nodes),
+                     key=lambda n: json.dumps(n, sort_keys=True))
+    encoded = json.dumps(ordered, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+
+def is_known_legacy_managed(node: dict) -> bool:
+    node_id = str(node.get("id") or "")
+    expected = KNOWN_LEGACY_MANAGED.get(node_id)
+    return bool(expected and digest([node]) == expected)
+
+
+def ownership_of(node: dict) -> str:
+    """Which ownership class one existing flow object belongs to."""
+    if is_managed(node):
+        return MANAGED_RPIMON
+    if is_known_legacy_managed(node):
+        return KNOWN_LEGACY_MANAGED_OBJECT
+    if str(node.get("id") or "") in KNOWN_LEGACY_MANAGED:
+        return LEGACY_FINGERPRINT_MISMATCH
+    if looks_legacy(node):
+        return UNVERIFIED_LEGACY_CANDIDATE
+    return APPLICATION_OBJECT
+
+
+def described(node: dict) -> dict:
+    """One existing object, named the way an operator has to look for it."""
+    ownership = ownership_of(node)
+    return {
+        "id": str(node.get("id") or ""),
+        "type": str(node.get("type") or ""),
+        "name": str(node.get("name") or node.get("label") or ""),
+        "ownership": ownership,
+        "ownership_evidence": OWNERSHIP_EVIDENCE[ownership],
+        "rpimon_owned": ownership in OWNED_BY_RPIMON,
+    }
+
+
+def full_digest(nodes: list) -> str:
+    """Hash of the file as it will be written, without normalization."""
+    return hashlib.sha256(
+        json.dumps(nodes, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def partition(nodes: list) -> tuple[list, list]:
+    managed = [
+        node for node in nodes
+        if is_managed(node) or is_known_legacy_managed(node)
+    ]
+    application = [
+        node for node in nodes
+        if not is_managed(node) and not is_known_legacy_managed(node)
+    ]
+    return managed, application
+
+
+def artifact_flows(path: pathlib.Path) -> tuple[list, dict]:
+    """Read flows and manifest out of a built release tarball or a directory."""
+    if path.is_dir():
+        flows = load_flows(path / "flows.rpimon7.json")
+        manifest = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
+        return flows, manifest
+    try:
+        with tarfile.open(path, "r:*") as handle:
+            flows_member = manifest_member = None
+            for member in handle.getmembers():
+                name = pathlib.PurePosixPath(member.name).name
+                if name == "flows.rpimon7.json":
+                    flows_member = member
+                elif name == "manifest.json":
+                    manifest_member = member
+            if flows_member is None or manifest_member is None:
+                raise FlowError(f"{path} is missing flows.rpimon7.json or manifest.json")
+            flows = json.loads(handle.extractfile(flows_member).read().decode())
+            manifest = json.loads(handle.extractfile(manifest_member).read().decode())
+    except (OSError, tarfile.TarError, json.JSONDecodeError) as exc:
+        raise FlowError(f"cannot read artifact {path}: {exc}") from exc
+    if not isinstance(flows, list):
+        raise FlowError(f"{path} does not contain a flows array")
+    return flows, manifest
+
+
+def cmd_fingerprint(args) -> dict:
+    nodes = load_flows(args.flows)
+    managed, application = partition(nodes)
+    return {
+        "flows": str(args.flows),
+        "node_count": len(nodes),
+        "managed_count": len(managed),
+        "application_count": len(application),
+        "application_sha256": digest(application),
+        "full_sha256": full_digest(nodes),
+        "managed_markers": sorted({marker_of(n) for n in managed if marker_of(n)}),
+        "note": ("The application hash excludes canvas coordinates, so tidying the "
+                 "editor does not fail a deployment. It includes everything that "
+                 "affects behaviour."),
+    }
+
+
+#: Where a collision actually has to be corrected. An object the Pi's
+#: application owns means the RPIMon artifact claims an id it may not have; an
+#: object that only looks like legacy RPIMon means ownership evidence was never
+#: reconciled. Neither is fixed by editing the Pi's flow by hand.
+ARTIFACT_CONFLICT = "rpimon_artifact"
+LEGACY_OWNERSHIP = "legacy_ownership"
+BOTH_CAUSES = "both"
+
+
+# --------------------------------------------------------------------------
+# Coexisting with an object RPIMon does not own
+# --------------------------------------------------------------------------
+#
+# An id collision used to be a permanent refusal: the incoming RPIMon object
+# wanted an id an application or unidentified object already held, and the whole
+# update stopped. The safety rule behind that is right and unchanged -- an object
+# RPIMon does not positively own is never replaced, edited or deleted -- but the
+# conclusion was wrong. RPIMon owns the incoming side of the collision, so the
+# side that moves is RPIMon's: the managed object takes a different id and every
+# RPIMon-internal reference to it is rewritten with it.
+#
+# The new id is derived from the old one, so a device that collides today
+# resolves to the same id on every later deployment, and the managed set stays
+# positively identifiable by its ownership marker either way.
+
+#: Fixed input to the derivation, so a remapped id cannot be confused with an id
+#: any other tool would generate for the same object.
+REMAP_SALT = "trapped-rpimon:id-remap:"
+
+#: Node-RED ids are 16 hexadecimal characters in current generations, and older
+#: `xxxxxxxx.xxxxxx` ids are accepted anywhere an id is read, so the shorter
+#: modern shape is safe on every Node-RED this component installs into.
+REMAP_LENGTH = 16
+
+
+def remapped_id(node_id: str, taken: set[str]) -> str:
+    """A stable replacement id for one RPIMon-owned object.
+
+    Derived from the id being replaced rather than randomly generated: the same
+    collision has to produce the same id on every deployment, or an update would
+    install a second copy of an object it had already installed.
+    """
+    for attempt in range(1000):
+        seed = REMAP_SALT + node_id + (f":{attempt}" if attempt else "")
+        candidate = hashlib.sha256(seed.encode()).hexdigest()[:REMAP_LENGTH]
+        if candidate not in taken:
+            return candidate
+    raise FlowError(f"no free replacement id could be derived for {node_id!r}")
+
+
+def rewrite_ids(value, mapping: dict[str, str]):
+    """Replace remapped ids everywhere the managed set refers to them.
+
+    Node-RED spells a reference to a node in several places -- `id` itself, `z`,
+    `g`, `wires`, `nodes`, `links`, `scope`, and the property a node uses to name
+    its configuration node -- and new node types add more. So the whole managed
+    object is walked and every string that *is* one of the remapped ids is
+    rewritten, rather than maintaining a list of reference properties that a new
+    node type would quietly fall off.
+
+    Only the incoming RPIMon objects are walked. Nothing on the application side
+    is read or written here.
+    """
+    if isinstance(value, dict):
+        return {key: rewrite_ids(item, mapping) for key, item in value.items()}
+    if isinstance(value, list):
+        return [rewrite_ids(item, mapping) for item in value]
+    if isinstance(value, str):
+        return mapping.get(value, value)
+    return value
+
+
+def resolve_collisions(incoming: list, existing: list,
+                       existing_by_id: dict) -> tuple[list, list[dict]]:
+    """Move RPIMon's own colliding ids out of the way, and say which moved."""
+    colliding = [node for node in incoming if str(node.get("id")) in existing_by_id]
+    if not colliding:
+        return incoming, []
+    taken = {str(node.get("id") or "") for node in existing}
+    taken |= {str(node.get("id") or "") for node in incoming}
+    mapping: dict[str, str] = {}
+    for node in colliding:
+        node_id = str(node.get("id"))
+        replacement = remapped_id(node_id, taken)
+        taken.add(replacement)
+        mapping[node_id] = replacement
+    remapped = [
+        {"from": node_id, "to": replacement,
+         "coexists_with": described(existing_by_id[node_id])}
+        for node_id, replacement in sorted(mapping.items())
+    ]
+    return rewrite_ids(incoming, mapping), remapped
+
+
+def collision_refusal(args, release: dict, collisions: list) -> dict:
+    """The structured form of a refused merge, one entry per colliding object."""
+    objects = sorted((described(node) for node in collisions),
+                     key=lambda item: item["id"])
+    application_ids = [item["id"] for item in objects
+                       if item["ownership"] == APPLICATION_OBJECT]
+    legacy_ids = [item["id"] for item in objects
+                  if item["ownership"] in (LEGACY_FINGERPRINT_MISMATCH,
+                                           UNVERIFIED_LEGACY_CANDIDATE)]
+    if application_ids and legacy_ids:
+        locus = BOTH_CAUSES
+    elif legacy_ids:
+        locus = LEGACY_OWNERSHIP
+    else:
+        locus = ARTIFACT_CONFLICT
+    return {
+        "refusal": "flow_object_collision",
+        "flows": str(args.flows),
+        "artifact": str(args.artifact),
+        **release,
+        "collisions": objects,
+        "collision_ids": [item["id"] for item in objects],
+        "application_object_ids": application_ids,
+        "unresolved_legacy_ids": legacy_ids,
+        "conflict_locus": locus,
+        # Nothing was written and nothing was deleted: the merge is a pure
+        # function that refused before producing an output file.
+        "objects_left_untouched": True,
+        "flows_unchanged": True,
+    }
+
+
+def cmd_merge(args) -> dict:
+    """Replace the managed set and prove the application set is untouched."""
+    existing = load_flows(args.flows)
+    incoming, manifest = artifact_flows(args.artifact)
+
+    release = {
+        "release_version": manifest.get("release_version"),
+        "build_profile": manifest.get("build_profile"),
+        "resource_profile": manifest.get("resource_profile"),
+    }
+
+    if not all(is_managed(node) for node in incoming):
+        unmarked = sorted(str(n.get("id") or "") for n in incoming if not is_managed(n))
+        raise FlowError(
+            f"artifact contains objects without the ownership marker: {unmarked}. "
+            "Merging it could not be bounded to the managed set.",
+            {
+                "refusal": "artifact_objects_unmarked",
+                "flows": str(args.flows),
+                "artifact": str(args.artifact),
+                **release,
+                "unmarked_object_ids": unmarked,
+                "flows_unchanged": True,
+            })
+
+    old_managed, application = partition(existing)
+    before = digest(application)
+
+    # Shared configuration nodes are the classic way an updater breaks a game:
+    # 18.8 forbids deleting or modifying the shared broker configuration, so an
+    # incoming node that collides with an application node id never overwrites
+    # it. RPIMon owns the incoming side, so the incoming id moves instead and
+    # the object it collided with is left exactly as it is.
+    existing_by_id = {str(node.get("id")): node for node in application}
+    incoming, remapped = resolve_collisions(incoming, existing, existing_by_id)
+
+    # The remap is the safety mechanism, so it is proved rather than assumed. A
+    # collision that survives it would mean an id was rewritten onto another one
+    # this file already holds, and that is a refusal with nothing written.
+    collisions = [existing_by_id[str(node.get("id"))] for node in incoming
+                  if str(node.get("id")) in existing_by_id]
+    if collisions:
+        raise FlowError(
+            "artifact objects still collide with existing flow object ids after "
+            f"remapping: {sorted({str(n.get('id')) for n in collisions})}. "
+            "Refusing to overwrite objects RPIMon does not positively own.",
+            collision_refusal(args, release, collisions))
+
+    merged = application + incoming
+    after = digest([node for node in merged if not is_managed(node)])
+    if before != after:
+        raise FlowError(
+            "merge changed the application-only fingerprint; refusing to produce it")
+
+    result = {
+        "result": "MERGED" if args.execute else "DRY_RUN",
+        "flows": str(args.flows),
+        "artifact": str(args.artifact),
+        **release,
+        "removed_managed_objects": len(old_managed),
+        "installed_managed_objects": len(incoming),
+        "application_objects": len(application),
+        "application_sha256_before": before,
+        "application_sha256_after": after,
+        "application_fingerprint_preserved": True,
+        "full_sha256_before": full_digest(existing),
+        "full_sha256_after": full_digest(merged),
+        "legacy_objects_remaining": sorted(
+            str(node.get("id")) for node in application if looks_legacy(node)),
+        # Which RPIMon-owned ids had to move so an object RPIMon does not own
+        # could stay exactly where it is, and what each one made room for.
+        "remapped_managed_objects": remapped,
+        "remapped_object_ids": [item["from"] for item in remapped],
+    }
+    if args.output:
+        if args.execute:
+            args.output.write_text(
+                json.dumps(merged, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            args.output.chmod(0o640)
+        result["output"] = str(args.output)
+    return result
+
+
+def cmd_strip(args) -> dict:
+    """Remove the managed set, leaving the application flow byte-identical."""
+    existing = load_flows(args.flows)
+    managed, application = partition(existing)
+    before = digest(application)
+    after = digest([node for node in application if not is_managed(node)])
+    if before != after:
+        raise FlowError("strip changed the application-only fingerprint; refusing")
+
+    result = {
+        "result": "STRIPPED" if args.execute else "DRY_RUN",
+        "removed_managed_objects": len(managed),
+        "application_objects": len(application),
+        "application_sha256": after,
+        "full_sha256_after": full_digest(application),
+        "legacy_objects_left_untouched": sorted(
+            str(node.get("id")) for node in application if looks_legacy(node)),
+        "note": ("Only marked objects are removed. Unidentified legacy RPIMon objects "
+                 "are left in place on purpose (18.9); removing them by guess is how a "
+                 "game flow gets damaged."),
+    }
+    if args.output:
+        if args.execute:
+            args.output.write_text(
+                json.dumps(application, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            args.output.chmod(0o640)
+        result["output"] = str(args.output)
+    return result
+
+
+def cmd_inspect(args) -> dict:
+    nodes = load_flows(args.flows)
+    managed, application = partition(nodes)
+    legacy = [node for node in application if looks_legacy(node)]
+    tabs = [node for node in nodes if node.get("type") == "tab"]
+    return {
+        "flows": str(args.flows),
+        "node_count": len(nodes),
+        "tabs": [{"id": t.get("id"), "label": t.get("label"),
+                  "managed": is_managed(t)} for t in tabs],
+        "managed": {
+            "count": len(managed),
+            "markers": sorted({marker_of(n) for n in managed if marker_of(n)}),
+            "types": sorted({str(n.get("type")) for n in managed}),
+        },
+        "application": {
+            "count": len(application),
+            "sha256": digest(application),
+        },
+        "legacy_candidates": [described(n) for n in legacy],
+        "legacy_note": ("Reported only. 18.9 permits removing a legacy object solely "
+                        "when it matches a known fingerprint; these are candidates for "
+                        "review, not a removal list."),
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    fingerprint = subparsers.add_parser("fingerprint")
+    fingerprint.add_argument("--flows", type=pathlib.Path, required=True)
+    fingerprint.set_defaults(func=cmd_fingerprint)
+
+    merge = subparsers.add_parser("merge")
+    merge.add_argument("--flows", type=pathlib.Path, required=True)
+    merge.add_argument("--artifact", type=pathlib.Path, required=True)
+    merge.add_argument("--output", type=pathlib.Path)
+    merge.add_argument("--execute", action="store_true")
+    merge.set_defaults(func=cmd_merge)
+
+    strip = subparsers.add_parser("strip")
+    strip.add_argument("--flows", type=pathlib.Path, required=True)
+    strip.add_argument("--output", type=pathlib.Path)
+    strip.add_argument("--execute", action="store_true")
+    strip.set_defaults(func=cmd_strip)
+
+    inspect = subparsers.add_parser("inspect")
+    inspect.add_argument("--flows", type=pathlib.Path, required=True)
+    inspect.set_defaults(func=cmd_inspect)
+
+    args = parser.parse_args()
+    try:
+        print(json.dumps(args.func(args), indent=2, sort_keys=True))
+    except FlowError as exc:
+        # The refusal is emitted as JSON on stdout as well as prose on stderr,
+        # so the deployment adapter records what was found rather than reducing
+        # this to the last line of an error stream.
+        document = {"result": "REFUSED", "refusal": "flow_tool_error",
+                    **(exc.detail or {}), "error": str(exc)}
+        print(json.dumps(document, indent=2, sort_keys=True))
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
