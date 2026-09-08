@@ -40,6 +40,8 @@ Central uses a dedicated Ed25519 automation identity, separate from the normal `
 
 No central Trapped fleet private key, Operations credential, release catalogue or portal credential is copied to this server.
 
+On September 8, 2026, the protected `lost-blast` endpoint was installed on `trapped-server` and the central site-status protocol reported `AVAILABLE` with agent version `1.0.0`.
+
 ## Site-local Pi trust
 
 Blast owns a separate site-local Pi management key plus a strict site-local `known_hosts`. A centrally resolved Lost/Blast target carries its governed current LAN address, but the site agent will not trust an unknown host key or widen target scope.
