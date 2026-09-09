@@ -4,15 +4,15 @@ Originally bootstrapped August 30, 2026; site-agent implementation updated Septe
 
 ## Architectural role
 
-`blast-server` is the Lost Games / It's a Blast site executor/storage node. `trapped-server` remains the authority for authorization, governed target scope, Operations data, managed releases/artifact selection, portal behavior and global history.
+`blast-server` is the shared site executor/storage node for two separate governed business locations: It's a Blast (`bl`) and Lost Games (`lg`). `trapped-server` remains the authority for authorization, governed target scope, Operations data, managed releases/artifact selection, portal behavior and global history.
 
-The site node executes only closed-list requests already resolved by central. It does not host a Trapped portal, Rundeck, Operations replica, release catalogue or independent configuration authority.
+The site node executes only closed-list requests already resolved by central. Central carries the selected business location separately; sharing this node never merges `bl` and `lg` authorization or device assignment. It does not host a Trapped portal, Rundeck, Operations replica, release catalogue or independent configuration authority.
 
 ## Tailnet state
 
 The Trapped tailnet is the canonical destination. The earlier permanent-separate-tailnet bootstrap assumption was superseded by the active `WO-2026-08-30-merge-lost-into-trapped-tailnet.md` migration.
 
-`blast-server` and `blast-pc` are already on the Trapped tailnet. `ax15`, `blast-imac`, `pt1` and `pt1player` remain in that separate migration track. The site-agent boundary is retained because Lost/Blast work and backups execute locally through `blast-server`, not because a second tailnet is required. No subnet route, exit-node route, IP forwarding or LAN bridge is used.
+`blast-server` and `blast-pc` are already on the Trapped tailnet. `ax15`, `blast-imac`, `pt1` and `pt1player` remain in that separate migration track. The site-agent boundary is retained because BL/LG work and backups execute locally through `blast-server`, not because a second tailnet is required. No subnet route, exit-node route, IP forwarding or LAN bridge is used.
 
 ## Site runtime
 
@@ -44,16 +44,18 @@ On September 8, 2026, the protected `lost-blast` endpoint was installed on `trap
 
 ## Site-local Pi trust
 
-Blast owns a separate site-local Pi management key plus a strict site-local `known_hosts`. A centrally resolved Lost/Blast target carries its governed current LAN address, but the site agent will not trust an unknown host key or widen target scope.
+Blast owns a separate site-local Pi management key plus a strict site-local `known_hosts`. A centrally resolved BL/LG target carries its governed current LAN address, but the site agent will not trust an unknown host key or widen target scope.
 
-There are currently no governed Lost/Blast Pis registered in central Operations, so the Pi `known_hosts` store intentionally has zero enrolled device entries. When a real Lost/Blast Pi is identified/onboarded, verify that Pi's host key and authorize the Blast site-local public key for that device. Do not pre-trust LAN neighbors.
+`bl` and `lg` share one LAN. Discovery is physical-network work, not business assignment: central scans that LAN once when both locations are selected, then offers a new candidate under both business locations so the operator chooses whether it belongs to It's a Blast or Lost Games.
+
+There are currently no governed BL/LG Pis registered in central Operations, so the Pi `known_hosts` store intentionally has zero enrolled device entries. When a real BL/LG Pi is identified/onboarded, verify that Pi's host key and authorize the Blast site-local public key for that device. Do not pre-trust LAN neighbors.
 
 ## Implemented site actions
 
 The fixed agent currently implements:
 
 - site status and connection checks;
-- Lost/Blast LAN discovery;
+- shared BL/LG LAN discovery;
 - light/detailed inventory collection using the exact central collector payload;
 - local full-Pi backup;
 - Node-RED flow backup, change inspection, send and restore;

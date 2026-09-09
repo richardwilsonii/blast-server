@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bounded Lost/Blast site executor for the Trapped central control plane."""
+"""Bounded shared Blast/Lost Games site executor for the Trapped central control plane."""
 from __future__ import annotations
 
 import base64
