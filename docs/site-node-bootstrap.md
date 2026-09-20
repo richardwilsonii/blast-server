@@ -48,7 +48,7 @@ Blast owns a separate site-local Pi management key plus a strict site-local `kno
 
 `bl` and `lg` share one LAN. Discovery is physical-network work, not business assignment: central scans that LAN once when both locations are selected, then offers a new candidate under both business locations so the operator chooses whether it belongs to It's a Blast or Lost Games.
 
-The onboarding path is intentionally only two operator actions. `Find New Devices` receives the protected shared Pi password only as an ephemeral payload over the already-authenticated central-to-site SSH channel, uses the existing OpenSSH client for a read-only hostname/Linux identity check, and retains the observed host key. `Add Devices to Database` then verifies that retained hostname/host key and authorizes the Blast site-local management key once. The password is never written to site state or Git, discovery itself does not mutate the Pi, and no additional SSH library/package is required.
+The onboarding path is intentionally only two operator actions. `Find New Devices` does not authenticate to unknown devices: it uses the site LAN's normal hostname resolution plus MAC/SSH reachability and records the SSH host key. `Add Devices to Database` is the first authenticated device action; it verifies the retained hostname/host key and authorizes the Blast site-local management key once using the protected Pi password. Discovery never needs the Pi password and never mutates the Pi.
 
 ## Implemented site actions
 
