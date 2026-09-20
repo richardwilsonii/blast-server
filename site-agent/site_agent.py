@@ -47,6 +47,7 @@ ACTIONS = {
 }
 TARGETED = ACTIONS - {"discover_unknown_devices", "site_status"}
 PAYLOAD_ACTIONS = {
+    "discover_unknown_devices": {"password"},  # accepted only for old central clients; ignored
     "repair_ssh_access": {"password", "host_key"},
     "deploy_managed_software": {"artifact", "config", "dependencies"}, "deploy_legacy_package": {"artifact"},
     "transfer_image": {"artifact"}, "send_nodered_flow": {"flow"},
