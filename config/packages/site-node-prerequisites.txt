@@ -5,7 +5,6 @@ openssh-server
 openssh-client
 rsync
 python3
-python3-paramiko
 bash
 iproute2
 iputils-ping
