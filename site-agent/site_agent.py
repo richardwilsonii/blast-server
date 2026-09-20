@@ -940,50 +940,109 @@ def managed_software(request: dict, payloads: dict[str, bytes]) -> dict:
                 rows.append(target_result(target, outcome, text))
     return base_result(request, overall(rows), rows)
 
-def password_read(ip: str, password: bytes) -> tuple[dict[str, str], str]:
-    import paramiko
-    secret=password.decode("utf-8").strip()
-    if not secret:
+def scan_host_key(ip: str) -> str:
+    run=subprocess.run(
+        ["ssh-keyscan","-T","3","-t","ed25519,ecdsa,rsa",ip],
+        capture_output=True,text=True,check=False,timeout=8)
+    for line in run.stdout.splitlines():
+        parts=line.split()
+        if len(parts) >= 3 and parts[1].startswith("ssh-"):
+            return f"{parts[1]} {parts[2]}"
+    raise AgentError("the device SSH host key could not be read")
+
+
+def password_ssh(ip: str, password: bytes, host_key: str, remote_command: str,
+                 timeout: int = 20) -> str:
+    import pty
+    import select
+    import time
+
+    if not password:
         raise AgentError("the protected Pi password payload is empty")
-    transport=None
+    parts=host_key.split()
+    if len(parts) != 2 or not parts[0].startswith("ssh-"):
+        raise AgentError("SSH host-key evidence is invalid")
+    fd,path=tempfile.mkstemp(prefix="trapped-discovery-known-hosts.")
     try:
-        sock=socket.create_connection((ip,22),timeout=5)
-        transport=paramiko.Transport(sock)
-        transport.start_client(timeout=8)
-        key=transport.get_remote_server_key()
-        host_key=f"{key.get_name()} {key.get_base64()}"
-        transport.auth_password("pi",secret)
-        channel=transport.open_session(timeout=8)
-        channel.exec_command(
-            "printf 'hostname=%s\\n' \"$(hostname)\"; "
-            "printf 'kernel=%s\\n' \"$(uname -s)\"; "
-            "printf 'os_id=%s\\n' \"$(. /etc/os-release 2>/dev/null; printf '%s' \"${ID:-}\")\"; "
-            "printf 'tailscale_installed=%s\\n' \"$(command -v tailscale >/dev/null 2>&1 && echo yes || echo no)\"; "
-            "printf 'TRAPPED_FACTS_DONE\\n'"
-        )
-        raw=channel.makefile("r",-1).read()
-        channel.recv_exit_status()
-        output=raw.decode("utf-8","replace") if isinstance(raw,bytes) else str(raw)
-        facts={}
-        for line in output.splitlines():
-            if "=" in line:
-                key_name,_,value=line.partition("=")
-                if key_name.isidentifier():
-                    facts[key_name]=value.strip()
-        if "TRAPPED_FACTS_DONE" not in output:
-            raise AgentError("the device did not complete the read-only identity read")
-        return facts,host_key
-    except paramiko.AuthenticationException as exc:
-        raise AgentError("the protected Pi password was rejected") from exc
-    except (OSError,paramiko.SSHException) as exc:
-        raise AgentError(str(exc)[:200]) from exc
+        os.write(fd,f"{ip} {host_key}\\n".encode())
+        os.fchmod(fd,0o600)
     finally:
-        secret=""
-        if transport is not None:
-            transport.close()
+        os.close(fd)
+    master,slave=pty.openpty()
+    command=[
+        "ssh","-o","BatchMode=no","-o","PubkeyAuthentication=no",
+        "-o","PreferredAuthentications=password,keyboard-interactive",
+        "-o","PasswordAuthentication=yes","-o","KbdInteractiveAuthentication=yes",
+        "-o","NumberOfPasswordPrompts=1","-o","StrictHostKeyChecking=yes",
+        "-o",f"UserKnownHostsFile={path}","-o","GlobalKnownHostsFile=/dev/null",
+        "-o","ConnectTimeout=8",f"pi@{ip}","--",remote_command,
+    ]
+    proc=subprocess.Popen(command,stdin=slave,stdout=slave,stderr=slave,close_fds=True)
+    os.close(slave)
+    output=bytearray()
+    sent=False
+    deadline=time.monotonic()+timeout
+    try:
+        while proc.poll() is None and time.monotonic() < deadline:
+            ready,_,_=select.select([master],[],[],0.25)
+            if not ready:
+                continue
+            try:
+                chunk=os.read(master,4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            output.extend(chunk)
+            if not sent and b"password:" in output.lower():
+                os.write(master,password+b"\\n")
+                sent=True
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=3)
+            raise AgentError("the device password SSH read timed out")
+        try:
+            while True:
+                chunk=os.read(master,4096)
+                if not chunk:
+                    break
+                output.extend(chunk)
+        except OSError:
+            pass
+    finally:
+        os.close(master)
+        pathlib.Path(path).unlink(missing_ok=True)
+    text=bytes(output).decode("utf-8","replace")
+    if proc.returncode != 0:
+        clean=" | ".join(line.strip() for line in text.splitlines() if line.strip())
+        if "permission denied" in clean.lower() or (sent and "password:" in clean.lower()):
+            raise AgentError("the protected Pi password was rejected")
+        raise AgentError(clean[-300:] or f"ssh exited {proc.returncode}")
+    return text
+
+
+def password_read(ip: str, password: bytes) -> tuple[dict[str, str], str]:
+    host_key=scan_host_key(ip)
+    remote=(
+        "printf 'hostname=%s\\n' \"$(hostname)\"; "
+        "printf 'kernel=%s\\n' \"$(uname -s)\"; "
+        "printf 'os_id=%s\\n' \"$(. /etc/os-release 2>/dev/null; printf '%s' \"\${ID:-}\")\"; "
+        "printf 'tailscale_installed=%s\\n' \"$(command -v tailscale >/dev/null 2>&1 && echo yes || echo no)\"; "
+        "printf 'TRAPPED_FACTS_DONE\\n'"
+    )
+    output=password_ssh(ip,password,host_key,remote)
+    facts={}
+    for line in output.splitlines():
+        if "=" in line:
+            key,_,value=line.partition("=")
+            if key.isidentifier():
+                facts[key]=value.strip().rstrip("\\r")
+    if "TRAPPED_FACTS_DONE" not in output:
+        raise AgentError("the device did not complete the read-only identity read")
+    return facts,host_key
+
 
 def bootstrap_site_key(target: dict, password: bytes, expected_host_key: bytes) -> tuple[str, str]:
-    import paramiko
     config=load_ssh_config()
     address=str(target.get("lan_ip") or "")
     reported=str(target.get("reported_hostname") or "").strip()
@@ -994,59 +1053,36 @@ def bootstrap_site_key(target: dict, password: bytes, expected_host_key: bytes) 
     parts=expected.split()
     if len(parts) != 2 or not parts[0].startswith("ssh-"):
         raise AgentError("retained discovery host-key evidence is invalid")
-    secret=password.decode("utf-8").strip()
-    if not secret:
-        raise AgentError("the protected Pi password payload is empty")
-    transport=None
-    try:
-        sock=socket.create_connection((address,22),timeout=5)
-        transport=paramiko.Transport(sock)
-        transport.start_client(timeout=8)
-        remote=transport.get_remote_server_key()
-        observed=f"{remote.get_name()} {remote.get_base64()}"
-        if observed != expected:
-            raise AgentError("the device SSH host key changed since discovery")
-        transport.auth_password(config["user"],secret)
-        channel=transport.open_session(timeout=8)
-        channel.exec_command("hostname")
-        raw=channel.makefile("r",-1).read()
-        actual=(raw.decode("utf-8","replace") if isinstance(raw,bytes) else str(raw)).strip()
-        channel.recv_exit_status()
-        if actual != reported:
-            raise AgentError(f"the device now reports hostname {actual!r}, expected {reported!r}")
-        public_key=pathlib.Path(config["identity"] + ".pub")
-        if public_key.is_symlink() or not public_key.is_file():
-            raise AgentError("site-local Pi management public key is unavailable")
-        pub=public_key.read_text(encoding="utf-8").strip()
-        command=(
-            "set -e; umask 077; mkdir -p ~/.ssh; chmod 700 ~/.ssh; "
-            "touch ~/.ssh/authorized_keys; chmod 600 ~/.ssh/authorized_keys; "
-            f"grep -qxF {shlex.quote(pub)} ~/.ssh/authorized_keys || "
-            f"printf '%s\\n' {shlex.quote(pub)} >> ~/.ssh/authorized_keys"
-        )
-        channel=transport.open_session(timeout=8)
-        channel.exec_command(command)
-        if channel.recv_exit_status() != 0:
-            raise AgentError("the device refused the site management key authorization")
-        known_hosts=pathlib.Path(config["known_hosts"])
-        line=f"{canonical} {observed}\n"
-        current=known_hosts.read_text(encoding="utf-8").splitlines() if known_hosts.exists() else []
-        existing=[row for row in current if row.split(maxsplit=1)[:1] == [canonical]]
-        if existing and any(row.strip() != line.strip() for row in existing):
-            raise AgentError("site-local known_hosts already contains a conflicting key for this device")
-        if not existing:
-            with known_hosts.open("a",encoding="utf-8") as handle:
-                handle.write(line)
-            os.chmod(known_hosts,0o600)
-        return actual,observed
-    except paramiko.AuthenticationException as exc:
-        raise AgentError("the protected Pi password was rejected") from exc
-    except (OSError,paramiko.SSHException) as exc:
-        raise AgentError(str(exc)[:200]) from exc
-    finally:
-        secret=""
-        if transport is not None:
-            transport.close()
+    public_key=pathlib.Path(config["identity"] + ".pub")
+    if public_key.is_symlink() or not public_key.is_file():
+        raise AgentError("site-local Pi management public key is unavailable")
+    pub=public_key.read_text(encoding="utf-8").strip()
+    if not pub:
+        raise AgentError("site-local Pi management public key is empty")
+    command=(
+        "set -e; "
+        f"[ \"$(hostname)\" = {shlex.quote(reported)} ] || exit 42; "
+        "umask 077; mkdir -p ~/.ssh; chmod 700 ~/.ssh; "
+        "touch ~/.ssh/authorized_keys; chmod 600 ~/.ssh/authorized_keys; "
+        f"grep -qxF {shlex.quote(pub)} ~/.ssh/authorized_keys || "
+        f"printf '%s\\n' {shlex.quote(pub)} >> ~/.ssh/authorized_keys; "
+        "printf 'TRAPPED_KEY_OK\\n'"
+    )
+    output=password_ssh(address,password,expected,command)
+    if "TRAPPED_KEY_OK" not in output:
+        raise AgentError("the device refused the site management key authorization")
+    known_hosts=pathlib.Path(config["known_hosts"])
+    line=f"{canonical} {expected}\\n"
+    current=known_hosts.read_text(encoding="utf-8").splitlines() if known_hosts.exists() else []
+    existing=[row for row in current if row.split(maxsplit=1)[:1] == [canonical]]
+    if existing and any(row.strip() != line.strip() for row in existing):
+        raise AgentError("site-local known_hosts already contains a conflicting key for this device")
+    if not existing:
+        with known_hosts.open("a",encoding="utf-8") as handle:
+            handle.write(line)
+        os.chmod(known_hosts,0o600)
+    return reported,expected
+
 
 def repair_ssh_access(request: dict,payloads: dict[str,bytes]) -> dict:
     password=payloads.get("password")
@@ -1062,6 +1098,7 @@ def repair_ssh_access(request: dict,payloads: dict[str,bytes]) -> dict:
         except AgentError as exc:
             rows.append(target_result(target,"BLOCKED",str(exc)))
     return base_result(request,overall(rows),rows,data=data)
+
 
 def discover(request: dict,payloads: dict[str,bytes]) -> dict:
     password=payloads.get("password")
