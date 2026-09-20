@@ -1026,7 +1026,7 @@ def password_read(ip: str, password: bytes) -> tuple[dict[str, str], str]:
     remote=(
         "printf 'hostname=%s\\n' \"$(hostname)\"; "
         "printf 'kernel=%s\\n' \"$(uname -s)\"; "
-        "printf 'os_id=%s\\n' \"$(. /etc/os-release 2>/dev/null; printf '%s' \"\${ID:-}\")\"; "
+        "printf 'os_id=%s\\n' \"$(. /etc/os-release 2>/dev/null; printf '%s' \"${ID:-}\")\"; "
         "printf 'tailscale_installed=%s\\n' \"$(command -v tailscale >/dev/null 2>&1 && echo yes || echo no)\"; "
         "printf 'TRAPPED_FACTS_DONE\\n'"
     )
