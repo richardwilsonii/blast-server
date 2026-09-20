@@ -20,7 +20,7 @@ import tempfile
 import uuid
 
 SCHEMA_VERSION = 1
-AGENT_VERSION = "1.0.1"
+AGENT_VERSION = "1.0.2"
 SITE = "lost-blast"
 SITE_NODE = "blast-server"
 ROOT = pathlib.Path(os.environ.get("TRAPPED_SITE_ROOT", "/home/blasty/trapped-site"))
@@ -47,7 +47,6 @@ ACTIONS = {
 }
 TARGETED = ACTIONS - {"discover_unknown_devices", "site_status"}
 PAYLOAD_ACTIONS = {
-    "discover_unknown_devices": {"password"},
     "repair_ssh_access": {"password", "host_key"},
     "deploy_managed_software": {"artifact", "config", "dependencies"}, "deploy_legacy_package": {"artifact"},
     "transfer_image": {"artifact"}, "send_nodered_flow": {"flow"},
@@ -1101,9 +1100,6 @@ def repair_ssh_access(request: dict,payloads: dict[str,bytes]) -> dict:
 
 
 def discover(request: dict,payloads: dict[str,bytes]) -> dict:
-    password=payloads.get("password")
-    if password is None:
-        return base_result(request,"FAILED",reason="discovery requires the protected Pi password payload")
     route=subprocess.run(["ip","-4","route","show","default"],text=True,capture_output=True,check=False)
     default=route.stdout.strip().splitlines()[0] if route.stdout.strip() else ""
     dev=""; parts=default.split()
@@ -1146,11 +1142,18 @@ def discover(request: dict,payloads: dict[str,bytes]) -> dict:
         candidate={"lan_ip":ip,"mac":mac,"neighbor_state":state,"ssh_reachable":ssh_reachable}
         if ssh_reachable:
             try:
-                facts,host_key=password_read(ip,password)
-                candidate["facts"]=facts
-                candidate["ssh_host_key"]=host_key
-            except AgentError as exc:
-                candidate["auth_error"]=str(exc)
+                lookup=subprocess.run(["getent","hosts",ip],text=True,capture_output=True,check=False,timeout=4)
+                parts=lookup.stdout.strip().split()
+                if len(parts) >= 2:
+                    hostname=parts[1].rstrip(".")
+                    if hostname.lower().endswith(".local"):
+                        hostname=hostname[:-6]
+                    candidate["hostname"]=hostname
+                else:
+                    candidate["name_error"]="no LAN hostname resolved"
+                candidate["ssh_host_key"]=scan_host_key(ip)
+            except (OSError,subprocess.TimeoutExpired,AgentError) as exc:
+                candidate["name_error"]=str(exc)
         candidates.append(candidate)
     return base_result(request,"SUCCESS",data={"interface":dev,"subnet":str(network),"candidates":candidates})
 
