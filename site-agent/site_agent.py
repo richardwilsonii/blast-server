@@ -20,7 +20,7 @@ import tempfile
 import uuid
 
 SCHEMA_VERSION = 1
-AGENT_VERSION = "1.0.0"
+AGENT_VERSION = "1.0.1"
 SITE = "lost-blast"
 SITE_NODE = "blast-server"
 ROOT = pathlib.Path(os.environ.get("TRAPPED_SITE_ROOT", "/home/blasty/trapped-site"))
@@ -47,6 +47,8 @@ ACTIONS = {
 }
 TARGETED = ACTIONS - {"discover_unknown_devices", "site_status"}
 PAYLOAD_ACTIONS = {
+    "discover_unknown_devices": {"password"},
+    "repair_ssh_access": {"password", "host_key"},
     "deploy_managed_software": {"artifact", "config", "dependencies"}, "deploy_legacy_package": {"artifact"},
     "transfer_image": {"artifact"}, "send_nodered_flow": {"flow"},
     "restore_nodered_flow": {"flow", "credentials"},
@@ -938,7 +940,133 @@ def managed_software(request: dict, payloads: dict[str, bytes]) -> dict:
                 rows.append(target_result(target, outcome, text))
     return base_result(request, overall(rows), rows)
 
+def password_read(ip: str, password: bytes) -> tuple[dict[str, str], str]:
+    import paramiko
+    secret=password.decode("utf-8").strip()
+    if not secret:
+        raise AgentError("the protected Pi password payload is empty")
+    transport=None
+    try:
+        sock=socket.create_connection((ip,22),timeout=5)
+        transport=paramiko.Transport(sock)
+        transport.start_client(timeout=8)
+        key=transport.get_remote_server_key()
+        host_key=f"{key.get_name()} {key.get_base64()}"
+        transport.auth_password("pi",secret)
+        channel=transport.open_session(timeout=8)
+        channel.exec_command(
+            "printf 'hostname=%s\\n' \"$(hostname)\"; "
+            "printf 'kernel=%s\\n' \"$(uname -s)\"; "
+            "printf 'os_id=%s\\n' \"$(. /etc/os-release 2>/dev/null; printf '%s' \"${ID:-}\")\"; "
+            "printf 'tailscale_installed=%s\\n' \"$(command -v tailscale >/dev/null 2>&1 && echo yes || echo no)\"; "
+            "printf 'TRAPPED_FACTS_DONE\\n'"
+        )
+        raw=channel.makefile("r",-1).read()
+        channel.recv_exit_status()
+        output=raw.decode("utf-8","replace") if isinstance(raw,bytes) else str(raw)
+        facts={}
+        for line in output.splitlines():
+            if "=" in line:
+                key_name,_,value=line.partition("=")
+                if key_name.isidentifier():
+                    facts[key_name]=value.strip()
+        if "TRAPPED_FACTS_DONE" not in output:
+            raise AgentError("the device did not complete the read-only identity read")
+        return facts,host_key
+    except paramiko.AuthenticationException as exc:
+        raise AgentError("the protected Pi password was rejected") from exc
+    except (OSError,paramiko.SSHException) as exc:
+        raise AgentError(str(exc)[:200]) from exc
+    finally:
+        secret=""
+        if transport is not None:
+            transport.close()
+
+def bootstrap_site_key(target: dict, password: bytes, expected_host_key: bytes) -> tuple[str, str]:
+    import paramiko
+    config=load_ssh_config()
+    address=str(target.get("lan_ip") or "")
+    reported=str(target.get("reported_hostname") or "").strip()
+    canonical=str(target["canonical_name"])
+    if not address or not reported:
+        raise AgentError("the enrolled target has no retained LAN address/hostname")
+    expected=expected_host_key.decode("utf-8").strip()
+    parts=expected.split()
+    if len(parts) != 2 or not parts[0].startswith("ssh-"):
+        raise AgentError("retained discovery host-key evidence is invalid")
+    secret=password.decode("utf-8").strip()
+    if not secret:
+        raise AgentError("the protected Pi password payload is empty")
+    transport=None
+    try:
+        sock=socket.create_connection((address,22),timeout=5)
+        transport=paramiko.Transport(sock)
+        transport.start_client(timeout=8)
+        remote=transport.get_remote_server_key()
+        observed=f"{remote.get_name()} {remote.get_base64()}"
+        if observed != expected:
+            raise AgentError("the device SSH host key changed since discovery")
+        transport.auth_password(config["user"],secret)
+        channel=transport.open_session(timeout=8)
+        channel.exec_command("hostname")
+        raw=channel.makefile("r",-1).read()
+        actual=(raw.decode("utf-8","replace") if isinstance(raw,bytes) else str(raw)).strip()
+        channel.recv_exit_status()
+        if actual != reported:
+            raise AgentError(f"the device now reports hostname {actual!r}, expected {reported!r}")
+        public_key=pathlib.Path(config["identity"] + ".pub")
+        if public_key.is_symlink() or not public_key.is_file():
+            raise AgentError("site-local Pi management public key is unavailable")
+        pub=public_key.read_text(encoding="utf-8").strip()
+        command=(
+            "set -e; umask 077; mkdir -p ~/.ssh; chmod 700 ~/.ssh; "
+            "touch ~/.ssh/authorized_keys; chmod 600 ~/.ssh/authorized_keys; "
+            f"grep -qxF {shlex.quote(pub)} ~/.ssh/authorized_keys || "
+            f"printf '%s\\n' {shlex.quote(pub)} >> ~/.ssh/authorized_keys"
+        )
+        channel=transport.open_session(timeout=8)
+        channel.exec_command(command)
+        if channel.recv_exit_status() != 0:
+            raise AgentError("the device refused the site management key authorization")
+        known_hosts=pathlib.Path(config["known_hosts"])
+        line=f"{canonical} {observed}\n"
+        current=known_hosts.read_text(encoding="utf-8").splitlines() if known_hosts.exists() else []
+        existing=[row for row in current if row.split(maxsplit=1)[:1] == [canonical]]
+        if existing and any(row.strip() != line.strip() for row in existing):
+            raise AgentError("site-local known_hosts already contains a conflicting key for this device")
+        if not existing:
+            with known_hosts.open("a",encoding="utf-8") as handle:
+                handle.write(line)
+            os.chmod(known_hosts,0o600)
+        return actual,observed
+    except paramiko.AuthenticationException as exc:
+        raise AgentError("the protected Pi password was rejected") from exc
+    except (OSError,paramiko.SSHException) as exc:
+        raise AgentError(str(exc)[:200]) from exc
+    finally:
+        secret=""
+        if transport is not None:
+            transport.close()
+
+def repair_ssh_access(request: dict,payloads: dict[str,bytes]) -> dict:
+    password=payloads.get("password")
+    host_key=payloads.get("host_key")
+    if password is None or host_key is None:
+        raise AgentError("SSH bootstrap requires protected password and retained host-key evidence")
+    rows=[]; data={}
+    for target in request["targets"]:
+        try:
+            hostname,observed=bootstrap_site_key(target,password,host_key)
+            data[target["canonical_name"]]={"reported_hostname":hostname,"host_key":observed}
+            rows.append(target_result(target,"SUCCESS","site-local management key authorized"))
+        except AgentError as exc:
+            rows.append(target_result(target,"BLOCKED",str(exc)))
+    return base_result(request,overall(rows),rows,data=data)
+
 def discover(request: dict,payloads: dict[str,bytes]) -> dict:
+    password=payloads.get("password")
+    if password is None:
+        return base_result(request,"FAILED",reason="discovery requires the protected Pi password payload")
     route=subprocess.run(["ip","-4","route","show","default"],text=True,capture_output=True,check=False)
     default=route.stdout.strip().splitlines()[0] if route.stdout.strip() else ""
     dev=""; parts=default.split()
@@ -954,7 +1082,6 @@ def discover(request: dict,payloads: dict[str,bytes]) -> dict:
     if not cidr: return base_result(request,"FAILED",reason="site LAN IPv4 subnet could not be resolved")
     network=ipaddress.ip_interface(cidr).network
     if network.prefixlen < 22: return base_result(request,"REFUSED",reason=f"refusing discovery of unexpectedly broad subnet {network}")
-    # Bounded ping sweep using installed primitives, then read the kernel neighbour table.
     hosts=list(network.hosts())[:1022]
     procs=[]
     for ip in hosts:
@@ -979,8 +1106,15 @@ def discover(request: dict,payloads: dict[str,bytes]) -> dict:
         try:
             with socket.create_connection((ip,22),timeout=0.75): ssh_reachable=True
         except OSError: pass
-        candidates.append({"lan_ip":ip,"mac":mac,"neighbor_state":state,
-                           "ssh_reachable":ssh_reachable})
+        candidate={"lan_ip":ip,"mac":mac,"neighbor_state":state,"ssh_reachable":ssh_reachable}
+        if ssh_reachable:
+            try:
+                facts,host_key=password_read(ip,password)
+                candidate["facts"]=facts
+                candidate["ssh_host_key"]=host_key
+            except AgentError as exc:
+                candidate["auth_error"]=str(exc)
+        candidates.append(candidate)
     return base_result(request,"SUCCESS",data={"interface":dev,"subnet":str(network),"candidates":candidates})
 
 
@@ -1055,7 +1189,7 @@ HANDLERS={
     "backup_pi":backup_pi,"backup_nodered_flow":backup_nodered,"send_nodered_flow":send_nodered,
     "restore_nodered_flow":restore_nodered,"find_nodered_changes":nodered_changes,
     "deploy_legacy_package":legacy_package,"deploy_managed_software":managed_software,
-    "discover_unknown_devices":discover,"repair_ssh_access":unsupported_bounded,
+    "discover_unknown_devices":discover,"repair_ssh_access":repair_ssh_access,
     "schedule_device_reboot":schedule_reboot,"transfer_image":unsupported_bounded,
 }
 

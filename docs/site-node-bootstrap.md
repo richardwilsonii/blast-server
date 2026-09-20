@@ -1,6 +1,6 @@
 # Blast Site Node
 
-Originally bootstrapped August 30, 2026; site-agent implementation updated September 8, 2026.
+Originally bootstrapped August 30, 2026; site-agent implementation updated September 19, 2026.
 
 ## Architectural role
 
@@ -44,11 +44,11 @@ On September 8, 2026, the protected `lost-blast` endpoint was installed on `trap
 
 ## Site-local Pi trust
 
-Blast owns a separate site-local Pi management key plus a strict site-local `known_hosts`. A centrally resolved BL/LG target carries its governed current LAN address, but the site agent will not trust an unknown host key or widen target scope.
+Blast owns a separate site-local Pi management key plus a strict site-local `known_hosts`. A centrally resolved BL/LG target carries its governed current LAN address, and the site node never widens target scope.
 
 `bl` and `lg` share one LAN. Discovery is physical-network work, not business assignment: central scans that LAN once when both locations are selected, then offers a new candidate under both business locations so the operator chooses whether it belongs to It's a Blast or Lost Games.
 
-There are currently no governed BL/LG Pis registered in central Operations, so the Pi `known_hosts` store intentionally has zero enrolled device entries. When a real BL/LG Pi is identified/onboarded, verify that Pi's host key and authorize the Blast site-local public key for that device. Do not pre-trust LAN neighbors.
+The onboarding path is intentionally only two operator actions. `Find New Devices` receives the protected shared Pi password only as an ephemeral payload over the already-authenticated central-to-site SSH channel, uses it for a read-only hostname/Linux identity check, and retains the observed host key. `Add Devices to Database` then verifies that retained hostname/host key and authorizes the Blast site-local management key once. The password is never written to site state or Git, and discovery itself does not mutate the Pi.
 
 ## Implemented site actions
 
@@ -65,7 +65,7 @@ The fixed agent currently implements:
 
 File-bearing requests are size/SHA-256 bound. Managed software uses the exact artifact selected centrally. Components needing Debian packages receive the checksum-recorded exact dependency closure from central; the Pi does not need access to the Trapped internal APT service.
 
-`repair_ssh_access` and `transfer_image` remain protocol-defined explicit refusals until a bounded Blast-side executor is operationally needed. They never fall back to direct central execution.
+`repair_ssh_access` now provides the bounded first-enrollment site-key bootstrap used internally by Add Devices. `transfer_image` remains a protocol-defined explicit refusal until operationally needed. Neither action falls back to direct central execution.
 
 ## Node-RED safety
 
@@ -83,7 +83,7 @@ The initial server review recorded pre-existing security issues including disabl
 
 ## Remaining work
 
-1. Enroll verified Pi host keys and the Blast site-local public key as real Lost/Blast Pis become governed targets.
+1. Continue normal BL/LG Find/Add onboarding as real devices become governed targets; the site-agent now owns the one-time SSH bootstrap.
 2. Continue the separate active tailnet migration work order for the remaining Lost devices; do not mix that migration with normal site-agent execution.
-3. Add optional SSH-repair/image-transfer executors only if those workflows become useful enough to justify them.
+3. Add image-transfer execution only if that workflow becomes useful enough to justify it.
 4. Add telemetry buffering only if site operation demonstrates a need.
